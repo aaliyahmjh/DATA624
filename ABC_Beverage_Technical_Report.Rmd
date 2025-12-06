@@ -166,7 +166,7 @@ cat("Test set:", nrow(test_data), "rows\n")
 # Model Training
 
 To evaluate different approaches for predicting pH, we trained five machine learning models: 
-
+git 
 - Multiple Linear Regression
 - Random Forest
 - XGBoost
@@ -225,7 +225,7 @@ fit_xgb <- train(
   data = train_data,
   method = "xgbTree",
   trControl = ctrl,
-  tuneLength = 3,
+  tuneLength = 5,
   verbosity = 0
 )
 ```
@@ -238,7 +238,7 @@ fit_knn <- train(
   data = train_data,
   method = "knn",
   trControl = ctrl,
-  tuneLength = 20,
+  tuneLength = 5,
   preProcess = c("center", "scale")
 )
 ```
@@ -251,7 +251,7 @@ fit_mars <- train(
   data = train_data,
   method = "earth",
   trControl = ctrl,
-  tuneLength = 10,
+  tuneLength = 5,
   preProcess = c("center", "scale")
 )
 ```
