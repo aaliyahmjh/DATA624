@@ -149,24 +149,39 @@ Our preprocessing steps included:
 After preprocessing, the final training dataset contained 2,571 rows, and the cleaned test dataset contained 267 rows, both with no remaining missing values. This produced a clean and reliable foundation for training the machine learning models.
 
 ```{r preprocessing}
-clean_data <- function(df) {
-  df %>%
+clean_data <- function(df, is_train = TRUE) {
+  df <- df %>%
     rename_with(~str_replace_all(., " ", "_")) %>%
-    mutate(Brand_Code = as.numeric(as.factor(Brand_Code))) %>%
-    mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE))))
+    mutate(Brand_Code = as.numeric(as.factor(Brand_Code)))
+  
+  if (is_train) {
+    # Impute all numeric columns EXCEPT the target
+    df <- df %>%
+      mutate(across(where(is.numeric) & !all_of("PH"), 
+                    ~replace_na(., median(., na.rm = TRUE))))
+  } else {
+    # Test set: impute everything (no PH column present)
+    df <- df %>%
+      mutate(across(where(is.numeric), 
+                    ~replace_na(., median(., na.rm = TRUE))))
+  }
+  
+  df
 }
 
-train_data <- clean_data(train_raw) %>% drop_na(PH)  # Only drop rows missing the target
-test_data <- clean_data(test_raw) %>% select(-PH)
+train_data <- clean_data(train_raw, is_train = TRUE) %>% 
+  drop_na(PH)  # drop training rows with null target
+
+test_data <- clean_data(test_raw, is_train = FALSE) %>% 
+  select(-PH)
 
 cat("Training set:", nrow(train_data), "rows\n")
-cat("Test set:", nrow(test_data), "rows\n")
 ```
 
 # Model Training
 
 To evaluate different approaches for predicting pH, we trained five machine learning models: 
-
+git 
 - Multiple Linear Regression
 - Random Forest
 - XGBoost
@@ -225,7 +240,7 @@ fit_xgb <- train(
   data = train_data,
   method = "xgbTree",
   trControl = ctrl,
-  tuneLength = 3,
+  tuneLength = 5,
   verbosity = 0
 )
 ```
@@ -238,7 +253,7 @@ fit_knn <- train(
   data = train_data,
   method = "knn",
   trControl = ctrl,
-  tuneLength = 20,
+  tuneLength = 5,
   preProcess = c("center", "scale")
 )
 ```
@@ -251,7 +266,7 @@ fit_mars <- train(
   data = train_data,
   method = "earth",
   trControl = ctrl,
-  tuneLength = 10,
+  tuneLength = 5,
   preProcess = c("center", "scale")
 )
 ```
@@ -262,7 +277,7 @@ Across the three metrics: RMSE, R², and MAE - **Random Forest** performed the b
 
 XGBoost ranked second, with slightly higher error but still strong performance. The simpler models of KNN, MARS, and especially Linear Regression showed noticeably weaker accuracy, suggesting that the relationship between pH and the predictors is nonlinear and actually benefits from tree-based modeling.
 
-These results guided our decision to ultimately choose **Random Forest** as the leading candidate for final model training and evaluation.
+These results guided our decision to ultimately choose **Random Forest** as the leading candidate for final model training and evaluation. This is intuitive, as Random Forest would likely outperform linear regression and KNN as it handles the multicolinearity of the features we observed in the exploratory data analysis much better than linear models.
 
 ```{r training-metrics}
 models <- list(
