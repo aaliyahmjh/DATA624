@@ -1,0 +1,420 @@
+---
+title: "ABC Beverage pH Prediction: Technical Report"
+author: "Kevin Havis, Aaliyah John-Harry, Candace Grant, Erick Hadi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+set.seed(123)
+```
+
+```{r packages}
+library(tidyverse)
+library(readxl)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(earth)
+library(knitr)
+library(writexl)
+```
+
+# Executive Summary
+
+This technical report documents the development, evaluation, and selection of a predictive model for beverage pH using historical manufacturing data. In response to new regulatory and quality-control requirements, our goal was to identify key drivers of pH in the production process and build a reliable statistical model to predict pH for new batches.
+
+We conducted exploratory data analysis (EDA), applied pre-processing to clean and prepare the data, trained multiple machine learning models using 5-fold cross-validation and selected the strongest model based on cross-validated accuracy and stability. 
+
+A **Random Forest** model demonstrated the best predictive performance and interpretability for manufacturing stakeholders, achieving an RMSE of approximately **0.10** and explaining a substantial portion of the variance in pH. This final model was retrained on the full dataset and used to generate predictions for all new production records, which were delivered in Excel format.
+
+```{r data-paths}
+train_path <- "https://raw.githubusercontent.com/aaliyahmjh/DATA624/main/StudentData.xlsx"
+test_path  <- "https://raw.githubusercontent.com/aaliyahmjh/DATA624/main/StudentEvaluation.xlsx"
+
+download.file(train_path, destfile = "StudentData.xlsx", mode = "wb")
+download.file(test_path,  destfile = "StudentEvaluation.xlsx", mode = "wb")
+```
+
+```{r load-data}
+train_raw <- read_excel("StudentData.xlsx")
+test_raw  <- read_excel("StudentEvaluation.xlsx")
+```
+
+# Exploratory Data Analysis
+
+## Dataset Overview
+
+```{r eda-overview}
+cat("Training set dimensions:", nrow(train_raw), "rows x", ncol(train_raw), "columns\n")
+cat("Test set dimensions:", nrow(test_raw), "rows x", ncol(test_raw), "columns\n")
+```
+
+Predictors in the dataset include ingredient- and mixture-related measures (PSC, Usage Cont), process settings (Carb Volume, Filler Speed, Line Speed, various pressures and temperatures), dimensional specifications (Fill Height, Fill Ounces), and categorical identifiers such as Brand Code.
+
+## Missing Values
+
+The training dataset contained missing values across several predictors, with the highest occurring in **MFR (8.2%)** and **Brand Code (4.7%)**, while most other variables had less than 2% missingness. These gaps appeared across mechanical, chemical, and categorical fields, indicating that missingness was not isolated to a single system.
+
+Remediation steps were necessary to ensure all models could train consistently.
+
+```{r eda-missing}
+missing_train <- train_raw %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing") %>%
+  filter(Missing > 0) %>%
+  arrange(desc(Missing))
+
+if (nrow(missing_train) > 0) {
+  missing_train %>%
+    mutate(Percent = round(Missing / nrow(train_raw) * 100, 1)) %>%
+    kable(caption = "Variables with Missing Values (Training Set)")
+} else {
+  cat("No missing values in training set\n")
+}
+```
+
+## Target Variable (pH) Distribution
+
+The pH values in the training data follow a roughly normal, bell-shaped curve and stay tightly clustered around the target range. The average pH is **8.55**, with most batches landing very close to that number. Although the full range runs from 7.88 to 9.36, the histogram shows that the vast majority of products fall within a much narrower band.
+This concentration of values means even small deviations are operationally meaningful and emphasizes the need for a predictive model capable of detecting subtle shifts in pH.
+
+```{r eda-target}
+train_raw %>%
+  filter(!is.na(PH)) %>%
+  ggplot(aes(x = PH)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(aes(xintercept = mean(PH)), color = "darkred", linetype = "dashed", linewidth = 1) +
+  labs(title = "Distribution of pH Values", x = "pH", y = "Count") +
+  theme_minimal()
+
+train_raw %>%
+  filter(!is.na(PH)) %>%
+  summarise(
+    Mean = mean(PH),
+    SD = sd(PH),
+    Min = min(PH),
+    Max = max(PH),
+    Median = median(PH)
+  ) %>%
+  kable(digits = 3, caption = "pH Summary Statistics")
+```
+
+## Correlations with pH
+
+To get a quick sense of which variables might influence pH, we calculated simple pairwise correlations between pH and all numeric predictors. The table highlights the top 15 variables most strongly related to pH, either positively or negatively. The strongest correlation was with **Mnf Flow (–0.447)**, meaning higher flow rates tend to be associated with slightly lower pH values. 
+
+Several pressure- and filler-related measures (such as Bowl Setpoint, Filler Level, Pressure Setpoint, and Hydraulic Pressures) also showed moderate correlations, suggesting that mechanical settings in the production line may have meaningful effects on acidity. While correlations alone do not explain causation, they help identify which variables may be important for the predictive models and provide an early sense of how different parts of the production process relate to final pH.
+
+
+```{r eda-correlations}
+train_raw %>%
+  select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  as_tibble(rownames = "Variable") %>%
+  select(Variable, PH) %>%
+  filter(Variable != "PH") %>%
+  mutate(Abs_Correlation = abs(PH)) %>%
+  arrange(desc(Abs_Correlation)) %>%
+  head(15) %>%
+  rename(Correlation = PH) %>%
+  kable(digits = 3, caption = "Top 15 Variables Correlated with pH")
+```
+
+# Preprocessing
+
+Before training the models, we applied a few cleaning steps to make the dataset consistent and ready for analysis. Based on our experiments, KNN imputations did not meaningfully improve model performance. Therefore, we opted for a simpler and more stable preprocessing approach:
+
+Our preprocessing steps included:
+
+1. Standardizing column names by replacing spaces with underscores, which helps prevent parsing issues during modeling.
+2. Handling missing values by imputing all numeric predictors with their median values. This preserves the overall shape of the data while preventing models from failing due to incomplete rows.
+3. Encoding the Brand Code field as a numeric factor so that models can use it as a categorical input without creating inconsistencies between the training and test sets.
+4. Dropping only rows missing the target variable (pH) as a safeguard to ensure that the modeling dataset contained no missing target values. In practice no rows were removed because all pH values were present after preprocessing.
+
+After preprocessing, the final training dataset contained 2,571 rows, and the cleaned test dataset contained 267 rows, both with no remaining missing values. This produced a clean and reliable foundation for training the machine learning models.
+
+```{r preprocessing}
+clean_data <- function(df) {
+  df %>%
+    rename_with(~str_replace_all(., " ", "_")) %>%
+    mutate(Brand_Code = as.numeric(as.factor(Brand_Code))) %>%
+    mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE))))
+}
+
+train_data <- clean_data(train_raw) %>% drop_na(PH)  # Only drop rows missing the target
+test_data <- clean_data(test_raw) %>% select(-PH)
+
+cat("Training set:", nrow(train_data), "rows\n")
+cat("Test set:", nrow(test_data), "rows\n")
+```
+
+# Model Training
+
+To evaluate different approaches for predicting pH, we trained five machine learning models: 
+
+- Multiple Linear Regression
+- Random Forest
+- XGBoost
+- K-Nearest Neighbors
+- MARS. 
+
+Each model was trained using 5-fold cross-validation, which provides a reliable estimate of performance while keeping computation time reasonable. Although repeated cross-validation was initially tested, it was ultimately not used here because it significantly increased runtime without offering meaningful improvements during our preliminary tests.
+
+For fairness and consistency, all models were trained on the same preprocessed dataset and used the same cross-validation settings. Models that benefit from feature scaling (Linear Regression, KNN, and MARS) included centering and scaling steps, while Random Forest and XGBoost were trained on the raw numeric predictors. 
+
+This training set up allowed us to compare a mix of linear, nonlinear, tree-based, and distance-based approaches and identify which model best captures the factors that influence pH.
+
+```{r cv-setup}
+ctrl <- trainControl(
+  #method = "repeatedcv", # This takes forever so doing simple CV
+  #repeats = 3, # Enable if using repeated CV
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE
+)
+```
+
+## Multiple Linear Regression
+
+```{r train-lm}
+fit_lm <- train(
+  PH ~ .,
+  data = train_data,
+  method = "lm",
+  trControl = ctrl,
+  preProcess = c("center", "scale")
+)
+```
+
+## Random Forest
+
+```{r train-rf}
+rf_grid <- expand.grid(mtry = c(5, 10))
+
+fit_rf <- train(
+  PH ~ .,
+  data = train_data,
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = rf_grid,
+  importance = TRUE,
+  ntree = 300
+)
+```
+
+## XGBoost
+
+```{r train-xgb}
+fit_xgb <- train(
+  PH ~ .,
+  data = train_data,
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneLength = 3,
+  verbosity = 0
+)
+```
+
+## K-Nearest Neighbors
+
+```{r train-knn}
+fit_knn <- train(
+  PH ~ .,
+  data = train_data,
+  method = "knn",
+  trControl = ctrl,
+  tuneLength = 20,
+  preProcess = c("center", "scale")
+)
+```
+
+## MARS
+
+```{r train-mars}
+fit_mars <- train(
+  PH ~ .,
+  data = train_data,
+  method = "earth",
+  trControl = ctrl,
+  tuneLength = 10,
+  preProcess = c("center", "scale")
+)
+```
+
+## Training Metrics
+
+Across the three metrics: RMSE, R², and MAE - **Random Forest** performed the best overall. It achieved the lowest prediction error (RMSE = 0.10) and the highest explanatory power (R² = 0.68), indicating that it captured more of the underlying structure in the data than the other models.
+
+XGBoost ranked second, with slightly higher error but still strong performance. The simpler models of KNN, MARS, and especially Linear Regression showed noticeably weaker accuracy, suggesting that the relationship between pH and the predictors is nonlinear and actually benefits from tree-based modeling.
+
+These results guided our decision to ultimately choose **Random Forest** as the leading candidate for final model training and evaluation.
+
+```{r training-metrics}
+models <- list(
+  LM = fit_lm,
+  RF = fit_rf,
+  XGB = fit_xgb,
+  KNN = fit_knn,
+  MARS = fit_mars
+)
+
+results <- resamples(models)
+
+results_summary <- summary(results)$statistics
+
+train_metrics <- tibble(
+  Model = names(models),
+  RMSE = results_summary$RMSE[, "Mean"],
+  Rsquared = results_summary$Rsquared[, "Mean"],
+  MAE = results_summary$MAE[, "Mean"]
+) %>%
+  arrange(RMSE)
+
+train_metrics %>%
+  kable(digits = 4, caption = "Cross-Validation Training Metrics")
+```
+
+```{r training-plot}
+dotplot(results, main = "Model Comparison: Cross-Validation Results")
+```
+
+```{r best-model}
+best_model <- train_metrics %>% dplyr::slice(1)
+cat("Best performing model by RMSE:", best_model$Model, "\n")
+cat("RMSE:", round(best_model$RMSE, 4), "\n")
+cat("R-squared:", round(best_model$Rsquared, 4), "\n")
+```
+
+## Feature Importance
+
+To understand which manufacturing variables have the strongest influence on pH, we analyzed feature importance scores from the Random Forest model. Random Forest naturally measures how much each predictor reduces prediction error across the ensemble.
+
+The results show that pH is driven primarily by *process-related variables* rather than any single dominant factor. The top contributors include Mnf_Flow, Temperature, Pressure_Vacuum, Carb_Rel, and Oxygen_Filler, all of which directly relate to carbonation, pressure control, or flow dynamics in the production line. Many other variables—such as Filler_Speed, Usage_cont, Bowl_Setpoint, and several pressure readings also show meaningful influence, reflecting the interconnected nature of the manufacturing process.
+
+```{r feature-importance}
+rf_importance <- varImp(fit_rf)$importance %>%
+  as_tibble(rownames = "Feature") %>%
+  rename(Importance = Overall) %>%
+  mutate(Importance_Scaled = 100 * Importance / max(Importance)) %>%
+  arrange(desc(Importance_Scaled))
+
+rf_importance %>%
+  head(20) %>%
+  kable(digits = 2, caption = "Top 20 Features by Importance (Random Forest)")
+```
+
+```{r importance-plot}
+rf_importance %>%
+  head(20) %>%
+  mutate(Feature = fct_reorder(Feature, Importance_Scaled)) %>%
+  ggplot(aes(x = Importance_Scaled, y = Feature)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  labs(
+    title = "Random Forest Feature Importance",
+    subtitle = "Top 20 Manufacturing Process Variables",
+    x = "Relative Importance (%)",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+
+## Model Selection Rationale
+
+After evaluating all five models, **Random Forest** is selected as the final model for predicting pH for the following reasons:
+
+1. **Strong Predictive Performance**: Random Forest achieves competitive RMSE and R-squared values, demonstrating consistently reliable prediction accuracy.
+
+2. **Ability to Capture Complex Relationships**: pH is affected by a lot of process variables that interact with each other in complicated ways. Random Forest can naturally pick up on these patterns (including non-linear relationships) without us having to manually create extra features or engineer those interactions ourselves.
+
+3. **Robustness**: As an ensemble method, Random Forest is less sensitive to noise, less prone to overfitting, and performs reliably even when predictors are correlated or have varying scales. 
+
+4. **Clear Feature Importance Insights**: The model provides interpretable variable importance rankings, which highlight the key manufacturing drivers of pH. These insights are useful for engineering teams seeking process improvements or monitoring critical control points.
+
+
+5. **Practical Communication Value**: Random Forest outputs—such as feature importance charts—are intuitive and easy to communicate to operations leadership, QA teams, and regulatory stakeholders, supporting transparent decision-making.
+
+# Conclusion
+
+## Final Predictions
+
+With the Random Forest model selected as the final model, we applied it to the cleaned evaluation dataset to generate predicted pH values. Because all preprocessing steps were completed earlier, the model could be applied directly to the test data with no additional transformations.
+
+The model produced 267 predictions, covering every observation in the evaluation dataset. The predicted pH values fall within a tight range of *8.17 to 8.79*, which aqligned well with the distribution in the training data. This consistency proves that the model is behaving as expected and producing stable, realistic predictions rather than extreme or out-of-range values.
+
+To visualize the output, we generated a histogram of predicted values. The distribution is smooth and unimodal, mirroring the naturally narrow variation seen in measured pH values - further supporting the reliability of the model’s predictions in practical manufacturing settings.
+
+Because the evaluation (test) dataset does not include true pH values, direct accuracy metrics cannot be calculated for this portion. Instead, confidence in these predictions is supported by Random Forest’s strong performance during cross-validation, where it achieved the lowest RMSE and highest R² among all models tested.
+
+All predictions were exported to an Excel file (pH_Predictions_RF.xlsx) for use in downstream analysis or review by manufacturing and quality teams.
+
+```{r final-predictions}
+final_predictions <- predict(fit_rf, newdata = test_data)
+
+output <- test_raw %>%
+  mutate(PH_Predicted = final_predictions)
+
+output_path <- "pH_Predictions_RF.xlsx"
+write_xlsx(output, output_path)
+
+cat("Predictions exported to:", output_path, "\n")
+cat("Number of predictions:", length(final_predictions), "\n")
+cat("Predicted pH range:", round(min(final_predictions), 2), "-", round(max(final_predictions), 2), "\n")
+```
+
+```{r prediction-distribution}
+tibble(PH_Predicted = final_predictions) %>%
+  ggplot(aes(x = PH_Predicted)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribution of Predicted pH Values",
+    subtitle = "Random Forest Model Predictions on Test Set",
+    x = "Predicted pH",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+## Final Model Recommendation
+
+We recommend deploying the **Random Forest** model for pH prediction in ABC Beverage's manufacturing process. The model achieves an R-squared of approximately `r round(train_metrics$Rsquared[train_metrics$Model == "RF"], 2)` on cross-validation, indicating it explains a substantial portion of pH variability.
+
+**Key Process Variables** (Top 5 by importance):
+
+```{r top-features}
+rf_importance %>%
+  head(5) %>%
+  select(Feature, Importance_Scaled) %>%
+  rename(`Relative Importance (%)` = Importance_Scaled) %>%
+  kable(digits = 1)
+```
+
+## Recommendations
+
+1. **Process Monitoring**: Prioritize monitoring and controlling the top-ranked process variables (such as Mnf_Flow, Temperature, Pressure_Vacuum). These factors have the greatest influence on pH and should be the primary focus for quality improvement and troubleshooting.
+
+2. **Real-Time Prediction**: Deploy the Random Forest model to generate batch-level or real-time predicted pH values. This enables operators to make proactive adjustments before pH drifts out of specification.
+   
+3. **Model Maintenance**: Retrain the model quarterly (or whenever a meaningful process change occurs) using the most recent production data. This keeps predictions aligned with evolving equipment behavior, raw materials, and operational conditions.
+
+4. **Alert Thresholds**: Implement automated alerts when predicted pH values approach regulatory or internal specification limits. This supports early detection of process deviations and reduces the risk of noncompliant batches.
+
+The Random Forest model demonstrated the most reliable performance across all tested algorithms and provides clear interpretability through feature importance rankings. By implementing the recommendations above (particularly targeted process monitoring, real-time prediction, and routine model maintenance), ABC Beverage can incorporate predictive analytics into its quality-control workflow and better manage pH variability across the manufacturing process. 
+
+The model’s predictions are now ready for operational evaluation and can be integrated into existing monitoring systems.
