@@ -152,7 +152,7 @@ After preprocessing, the final training dataset contained 2,571 rows, and the cl
 clean_data <- function(df) {
   df %>%
     rename_with(~str_replace_all(., " ", "_")) %>%
-    mutate(Brand_Code = as.numeric(as.factor(Brand_Code))) %>%
+    mutate(Brand_Code = as.numeric(as.factor(Brand_Code, ordered=FALSE))) %>%
     mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE))))
 }
 
