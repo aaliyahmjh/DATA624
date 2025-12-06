@@ -262,7 +262,7 @@ Across the three metrics: RMSE, R², and MAE - **Random Forest** performed the b
 
 XGBoost ranked second, with slightly higher error but still strong performance. The simpler models of KNN, MARS, and especially Linear Regression showed noticeably weaker accuracy, suggesting that the relationship between pH and the predictors is nonlinear and actually benefits from tree-based modeling.
 
-These results guided our decision to ultimately choose **Random Forest** as the leading candidate for final model training and evaluation.
+These results guided our decision to ultimately choose **Random Forest** as the leading candidate for final model training and evaluation. This is intuitive, as Random Forest would likely outperform linear regression and KNN as it handles the multicolinearity of the features we observed in the exploratory data analysis much better than linear models.
 
 ```{r training-metrics}
 models <- list(
